@@ -34,6 +34,7 @@ from datetime import datetime
 from email.mime.text import MIMEText
 from pathlib import Path
 
+
 import pandas as pd
 from playwright.sync_api import sync_playwright
 
@@ -177,6 +178,28 @@ def export_brand(page, brand_name: str) -> Path:
     page.get_by_role("button", name=re.compile(r"^Brand:")).click()
     page.get_by_role("option", name=brand_name, exact=True).click()
 
+    # Confirm the switch registered -- the button relabels itself to the
+    # brand now selected. This is a correctness check, NOT a settle wait.
+    page.get_by_role("button", name=f"Brand: {brand_name}").wait_for(timeout=config.NAV_TIMEOUT_MS)
+
+    # DO NOT add a "wait for the page to settle" pause here. It is the
+    # obvious-looking fix for the first export click failing every time,
+    # and it makes things much worse:
+    #
+    # Waiting (label + networkidle + ~5s) does make the FIRST click produce
+    # a real download -- and Edge then hard-crashes 1-2.5s later, mid-
+    # download, taking the whole run with it. Reproduced repeatedly, with
+    # process exit codes 0xC0000005 (access violation) and 0x80000003
+    # (breakpoint). The crash is intermittent but frequent, and it happens
+    # whether or not we touch the Download object, so it cannot be dodged
+    # by handling the download differently.
+    #
+    # The two-click behaviour below is load-bearing: click 1 appears to
+    # kick off CSV generation server-side and legitimately returns no file,
+    # click 2 collects the finished one. Letting click 1 do both is what
+    # destabilises Edge. So the "failed" first click is normal and expected
+    # -- it costs ~10s per brand and the run completes 4/4 with it.
+
     def open_menu_and_click_export():
         # Opens the "..." menu above the results table. This selector is
         # positional, not name/role-based -- the button itself has no
@@ -197,35 +220,59 @@ def export_brand(page, brand_name: str) -> Path:
     # between attempts on purpose, rather than clicking as fast as possible.
     downloads = []
     handler = lambda d: downloads.append(d)
-    page.on("download", handler)
+    # Listen on the CONTEXT rather than the page: TrackStreet opens a blank
+    # tab as part of the export, so a download won't always be attributed to
+    # the page we clicked on. Context-level catches it either way.
+    context = page.context
+    context.on("download", handler)
     try:
         max_clicks = 4
         for click_num in range(1, max_clicks + 1):
             open_menu_and_click_export()
+            # Plain time.sleep, not page.wait_for_timeout: the download can
+            # land mid-sleep and take the serving tab down with it, and a
+            # page.* call would then raise and throw away an export that
+            # actually succeeded. time.sleep can't fail that way.
             for _ in range(10):  # poll every 1s, up to 10s per click
                 if downloads:
                     break
-                page.wait_for_timeout(1000)
+                time.sleep(1)
             if downloads:
                 logger.info("Download started after %d click(s) for %s", click_num, brand_name)
                 break
             if click_num < max_clicks:
-                page.wait_for_timeout(3000)  # extra breathing room before trying again
+                time.sleep(3)  # extra breathing room before trying again
         else:
             raise TimeoutError(f"No download started for {brand_name} after {max_clicks} clicks")
         download = downloads[0]
-    finally:
-        page.remove_listener("download", handler)
+        logger.info("Filename: %s", download.suggested_filename)
 
-    config.DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    suffix = Path(download.suggested_filename).suffix or ".csv"
-    dest = config.DOWNLOAD_DIR / f"{_safe_filename(brand_name)}{suffix}"
-    download.save_as(dest)
-    logger.info("Saved %s export to %s", brand_name, dest)
+        # Leave the download strictly alone while Edge finishes writing it.
+        # Reading it too early (.path() or .save_as()) crashes the browser
+        # process with an access violation -- see DOWNLOAD_SETTLE_SEC in
+        # config.py before shortening or removing this.
+        time.sleep(config.DOWNLOAD_SETTLE_SEC)
+
+        # .path() blocks until the download is complete, so reaching the
+        # next line means the bytes are all there.
+        logger.info("Download complete: %s", download.path())
+
+        config.DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+        suffix = Path(download.suggested_filename).suffix or ".csv"
+        dest = config.DOWNLOAD_DIR / f"{_safe_filename(brand_name)}{suffix}"
+        download.save_as(dest)
+        logger.info("Saved %s export to %s", brand_name, dest)
+    finally:
+        context.remove_listener("download", handler)
     return dest
 
 
 def screenshot_on_failure(page, label: str):
+    # A dead browser can't be photographed. Say so in one line instead of
+    # dumping a Playwright traceback that buries the actual failure above it.
+    if page.is_closed():
+        logger.warning("Skipping %s screenshot -- browser is already closed.", label)
+        return
     try:
         config.SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -300,46 +347,111 @@ def combine_exports(paths_by_brand: dict) -> pd.DataFrame:
     return combined
 
 
+def _log_unparsed(col: str, before: pd.Series, after: pd.Series):
+    """Log values that were present before a conversion and came out blank
+    after it -- real data we couldn't parse, now a silent gap in Tableau.
+
+    Coercing rather than raising is deliberate: this step runs after every
+    brand has already been exported, so letting one bad cell abort the run
+    throws away all of that work for nothing. But a conversion that quietly
+    drops data is worse than one that fails loudly, so anything lost here
+    has to show up in the log."""
+    lost = before.notna() & after.isna()
+    if not lost.any():
+        return
+    examples = before[lost].astype(str).unique()[:5]
+    logger.warning(
+        "%s: %d value(s) did not match the expected format and were left "
+        "blank. Examples: %s", col, int(lost.sum()), ", ".join(repr(e) for e in examples),
+    )
+
+
+def _as_text(series: pd.Series) -> pd.Series:
+    """Get a string-dtype view of a column so the .str accessor is always
+    usable. Needed because a column that arrives entirely empty (a brand
+    with no rows for it) is inferred as float64, and .str on a float column
+    raises AttributeError -- which used to take the whole run down."""
+    return series.astype("string")
+
+
 def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     """Clean up known TrackStreet export quirks before writing to Tableau's
     data source. Every transformation here was confirmed against the full
     contents of real downloaded files (all rows, all 4 brands), not a
-    sample -- see project notes for how each was verified."""
+    sample -- see project notes for how each was verified.
+
+    That verification describes the exports as they looked when captured,
+    not a guarantee about future ones, so each step below coerces what it
+    can't parse and logs it instead of raising."""
     df = df.copy()
 
-    # "$1,234.56" (text) -> 1234.56 (float). Confirmed via a full-file
-    # regex check: every value in both columns matches this exact format
-    # across all 4 brands, so no error-handling fallback is needed here.
+    # "$1,234.56" (text) -> 1234.56 (float). Every value in both columns
+    # matched this format across all 4 brands when checked.
     for col in ("MAP", "Offer Price"):
         if col in df.columns:
-            df[col] = (
-                df[col].str.replace("$", "", regex=False)
-                       .str.replace(",", "", regex=False)
-                       .astype(float)
+            # Blank-after-stripping counts as legitimately missing, not as
+            # a parse failure -- so it isn't warned about below. Only a
+            # non-empty value we couldn't read is worth anyone's attention.
+            cleaned = (
+                _as_text(df[col]).str.replace("$", "", regex=False)
+                                 .str.replace(",", "", regex=False)
+                                 .str.strip()
+                                 .replace("", pd.NA)
             )
+            # .astype(object) first: to_numeric returns plain float64/NaN
+            # that way, rather than pandas' nullable Float64, keeping the
+            # column's dtype the same as it has always been downstream.
+            after = pd.to_numeric(cleaned.astype(object), errors="coerce")
+            _log_unparsed(col, cleaned, after)
+            df[col] = after
 
-    # "09/09/2026 12:59 PM UTC" (text) -> real datetime. Confirmed via a
-    # full-file regex check: every value matches this exact format.
+    # "09/09/2026 12:59 PM UTC" (text) -> real datetime. Every value
+    # matched this format when checked.
     if "Date/Time" in df.columns:
-        df["Date/Time"] = pd.to_datetime(df["Date/Time"], format="%m/%d/%Y %I:%M %p UTC")
+        before = _as_text(df["Date/Time"]).str.strip().replace("", pd.NA)
+        after = pd.to_datetime(before, format="%m/%d/%Y %I:%M %p UTC", errors="coerce")
+        _log_unparsed("Date/Time", before, after)
+        df["Date/Time"] = after
 
-    # "Yes" / blank -> real True/False. Confirmed via full-file value
-    # counts: no third value ever appears in any of these columns.
+    # "Yes" / blank -> real True/False. No third value appeared in any of
+    # these columns when checked -- if one ever does, it would otherwise be
+    # silently folded into False, so warn before doing exactly that.
     for col in ("Buy Box Winner", "Has Amazon Discount", "Out of Stock", "Price In Cart"):
         if col in df.columns:
-            df[col] = df[col] == "Yes"
+            values = _as_text(df[col]).str.strip()
+            unexpected = values[values.notna() & ~values.isin(["Yes", ""])].unique()
+            if len(unexpected):
+                logger.warning(
+                    "%s: unexpected value(s) treated as False: %s",
+                    col, ", ".join(repr(v) for v in unexpected[:5]),
+                )
+            df[col] = (values == "Yes").fillna(False).astype(bool)
 
     # Pad back to the standard 12 digits. Confirmed: Zurn has 99 rows
     # missing a leading zero in TrackStreet's own raw export (not
     # something our pipeline introduced) -- this fixes those without
     # needing to know which specific rows they are.
     if "UPC" in df.columns:
-        df["UPC"] = df["UPC"].str.zfill(12)
+        padded = _as_text(df["UPC"]).str.strip().str.zfill(12)
+        # zfill only pads, it never truncates or validates, so anything
+        # that isn't 12 digits afterwards (a 13-digit EAN, a stray letter,
+        # a float that picked up a ".0") came in malformed. Left as-is --
+        # dropping a row here would hide it -- but flagged.
+        malformed = padded[padded.notna() & ~padded.str.fullmatch(r"\d{12}")]
+        if len(malformed):
+            logger.warning(
+                "UPC: %d value(s) are not 12 digits after padding and were left "
+                "unchanged. Examples: %s",
+                len(malformed), ", ".join(repr(v) for v in malformed.unique()[:5]),
+            )
+        df["UPC"] = padded
 
     # Known typo in TrackStreet's own product data, confirmed by eye:
     # "Elkey" should be "Elkay".
     if "Product Title" in df.columns:
-        df["Product Title"] = df["Product Title"].str.replace("Elkey", "Elkay", regex=False)
+        df["Product Title"] = _as_text(df["Product Title"]).str.replace(
+            "Elkey", "Elkay", regex=False
+        )
 
     return df
 
@@ -417,25 +529,41 @@ def run():
     failed_brands = []
 
     with sync_playwright() as p:
-        launch_kwargs = {"headless": config.HEADLESS}
-        if config.BROWSER_CHANNEL:
-            launch_kwargs["channel"] = config.BROWSER_CHANNEL
 
-        # A persistent profile, not a fresh throwaway browser -- so
-        # TrackStreet's device-verification email only needs to be handled
-        # once every ~30 days by a human, instead of on every scheduled run.
-        config.PROFILE_DIR.mkdir(parents=True, exist_ok=True)
-        context = p.chromium.launch_persistent_context(str(config.PROFILE_DIR), **launch_kwargs)
-        page = context.pages[0] if context.pages else context.new_page()
-        page.set_default_timeout(config.NAV_TIMEOUT_MS)
+        def start_session():
+            """Launch a browser, log in, and land on the report page.
+            Called once normally, and again after each browser crash."""
+            launch_kwargs = {"headless": config.HEADLESS}
+            # Empty BROWSER_CHANNEL means Playwright's own bundled Chromium.
+            # Both it and the machine's Edge crash on download at similar
+            # rates, so this is not a reliability lever -- it's just no
+            # longer hardcoded over the top of the config setting.
+            if config.BROWSER_CHANNEL:
+                launch_kwargs["channel"] = config.BROWSER_CHANNEL
+
+            # A persistent profile, not a fresh throwaway browser -- so
+            # TrackStreet's device-verification email only needs to be
+            # handled once every ~30 days by a human, not on every run.
+            config.PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+            ctx = p.chromium.launch_persistent_context(
+                str(config.PROFILE_DIR), **launch_kwargs
+            )
+            pg = ctx.pages[0] if ctx.pages else ctx.new_page()
+            pg.set_default_timeout(config.NAV_TIMEOUT_MS)
+            with_retries(login, pg, what="Login")
+            with_retries(navigate_to_reports, pg, what="Navigate to reports")
+            return ctx, pg
+
+        def close_quietly(ctx):
+            try:
+                ctx.close()
+            except Exception:
+                pass  # already dead -- that's the usual case here
 
         try:
-            with_retries(login, page, what="Login")
-            with_retries(navigate_to_reports, page, what="Navigate to reports")
+            context, page = start_session()
         except Exception as exc:
             logger.error("Login/navigation failed after retries: %s", exc)
-            screenshot_on_failure(page, "login_failure")
-            context.close()
             send_alert(
                 "Login failed -- run aborted",
                 f"{exc}\n\nIf the attached screenshot shows a 'verify this "
@@ -446,21 +574,69 @@ def run():
             )
             sys.exit(1)
 
-        # NOTE: all 4 brands share one page/session. If a failed export
-        # leaves the UI in a bad state (a stuck modal, an error toast),
-        # later brands in this loop could fail too. If that turns out to
-        # be a real problem in practice, add a recovery step here (e.g.
-        # page.goto back to a known-good dashboard URL) between brands.
-        for brand_name in config.BRANDS:
+        # The browser itself crashes intermittently while downloading an
+        # export -- process exit 0xC0000005 / 0x80000003, surfacing here as
+        # "Target page, context or browser has been closed". It happens on
+        # both bundled Chromium and Edge, on a local profile, on the first
+        # or second click, so the script can't prevent it. What it CAN do is
+        # not lose the whole run to it: relaunch and retry the brand that
+        # was in flight. Already-downloaded brands are on disk and are kept.
+        #
+        # Brands are worked through a queue rather than a for-loop so a
+        # crashed brand can be retried without skipping it.
+        remaining = list(config.BRANDS)
+        attempts = {brand: 0 for brand in config.BRANDS}
+        relaunches = 0
+
+        while remaining:
+            brand_name = remaining[0]
             try:
-                path = with_retries(export_brand, page, brand_name, what=f"Export ({brand_name})")
-                paths_by_brand[brand_name] = path
+                paths_by_brand[brand_name] = export_brand(page, brand_name)
+                remaining.pop(0)
+                continue
             except Exception as exc:
                 logger.error("Export failed for %s: %s", brand_name, exc)
-                screenshot_on_failure(page, f"export_failure_{brand_name}")
-                failed_brands.append(brand_name)
 
-        context.close()
+            if page.is_closed():
+                # Browser crash: the export may well have been fine. Give
+                # this brand a fresh browser rather than counting it failed.
+                if relaunches >= config.MAX_BROWSER_RELAUNCHES:
+                    logger.error(
+                        "Browser crashed again and the relaunch budget (%d) is "
+                        "spent -- giving up on remaining brands: %s",
+                        config.MAX_BROWSER_RELAUNCHES, ", ".join(remaining),
+                    )
+                    failed_brands.extend(remaining)
+                    remaining.clear()
+                    break
+                relaunches += 1
+                logger.warning(
+                    "Browser crashed during %s -- relaunching (%d of %d) and "
+                    "retrying that brand. %d export(s) already safe on disk.",
+                    brand_name, relaunches, config.MAX_BROWSER_RELAUNCHES,
+                    len(paths_by_brand),
+                )
+                close_quietly(context)
+                try:
+                    context, page = start_session()
+                except Exception as exc:
+                    logger.error("Could not restart the browser: %s", exc)
+                    failed_brands.extend(remaining)
+                    remaining.clear()
+                    break
+                continue  # same brand, fresh browser
+
+            # Browser is alive, so this is a genuine export failure (bad
+            # selector, stuck modal, TrackStreet error). Retry in place.
+            screenshot_on_failure(page, f"export_failure_{brand_name}")
+            attempts[brand_name] += 1
+            if attempts[brand_name] > config.MAX_RETRIES:
+                failed_brands.append(brand_name)
+                remaining.pop(0)
+            else:
+                time.sleep(config.RETRY_DELAY_SEC)
+
+        close_quietly(context)
 
     if not paths_by_brand:
         msg = "All brand exports failed -- nothing to combine."

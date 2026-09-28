@@ -47,7 +47,17 @@ SCREENSHOT_DIR = LOG_DIR / "failure_screenshots"
 # what lets TrackStreet's "verify this new device" email only need to be
 # handled once every ~30 days by a human, instead of on every single run.
 # See README "One-time device verification" before scheduling this.
-PROFILE_DIR = BASE_DIR / "browser_profile"
+#
+# Keep this OUT of OneDrive (or any synced folder). A downloading Chromium
+# writes constantly to its profile, and OneDrive's sync driver locking or
+# relocating those files underneath it crashes the browser mid-download --
+# exit code 0xC0000005 / 0x80000003, surfacing as "Target page, context or
+# browser has been closed". Defaults to LOCALAPPDATA, which is never synced.
+# BASE_DIR can stay in OneDrive; only the live profile must be local.
+PROFILE_DIR = Path(
+    os.getenv("PROFILE_DIR")
+    or Path(os.getenv("LOCALAPPDATA", str(Path.home()))) / "TrackStreetSync" / "browser_profile"
+)
 
 # --- Output ------------------------------------------------------------
 # Fixed path Tableau is set up to auto-refresh from. Keep this stable --
@@ -74,6 +84,12 @@ LOCK_FILE = BASE_DIR / "trackstreet_sync.lock"
 # actually-still-running one, and gets ignored.
 LOCK_MAX_AGE_MINUTES = _int_env("LOCK_MAX_AGE_MINUTES", 60)
 
+# The browser crashes intermittently mid-download (see export_brand). Each
+# crash costs one relaunch + re-login, roughly 15s, and the brand is retried
+# on the fresh browser. 5 is enough headroom for 4 brands on a bad day
+# without letting a genuinely broken run spin forever.
+MAX_BROWSER_RELAUNCHES = _int_env("MAX_BROWSER_RELAUNCHES", 5)
+
 NAV_TIMEOUT_MS = _int_env("NAV_TIMEOUT_MS", 30000)
 MAX_RETRIES = _int_env("MAX_RETRIES", 2)
 RETRY_DELAY_SEC = _int_env("RETRY_DELAY_SEC", 10)
@@ -83,6 +99,23 @@ RETRY_DELAY_SEC = _int_env("RETRY_DELAY_SEC", 10)
 # time), so the cause isn't "needs more time" -- reverted to fail fast
 # instead of wasting minutes per run. See debug_export_timing.py.
 EXPORT_DOWNLOAD_TIMEOUT_MS = _int_env("EXPORT_DOWNLOAD_TIMEOUT_MS", 30000)
+# NOTE: there is deliberately no "wait for the page to settle after a brand
+# switch" setting here. Adding one makes the first export click succeed and
+# then crashes Edge mid-download -- see the long comment in export_brand().
+# The first click failing is expected behaviour, not a bug to tune out.
+
+# How long to leave the download completely alone after the download event
+# fires, before reading it with .path() / .save_as().
+#
+# DO NOT SET THIS TO 0 -- it is load-bearing, not a lazy sleep. Touching the
+# Download object while Edge is still writing the file crashes the browser
+# outright: process exit code 3221225477 (0xC0000005, access violation),
+# which surfaces in the log as the misleading "Target page, context or
+# browser has been closed" on save_as. Reproduced deliberately. 5s has run
+# clean across all 4 brands; the largest export is ~6.6MB (Elkay Inc.).
+# Raise it if exports grow a lot -- the cost is 5s per brand, the downside
+# of too low is a hard browser crash that loses the whole run.
+DOWNLOAD_SETTLE_SEC = _int_env("DOWNLOAD_SETTLE_SEC", 5)
 
 # --- Email alerts --------------------------------------------------------
 # Leave SMTP_HOST blank in .env to disable email alerts (failures will
