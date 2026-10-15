@@ -36,6 +36,28 @@ TRACKSTREET_URL = os.getenv("TRACKSTREET_URL", "https://app.trackstreet.com/logi
 TRACKSTREET_EMAIL = os.getenv("TRACKSTREET_EMAIL")
 TRACKSTREET_PASSWORD = os.getenv("TRACKSTREET_PASSWORD")
 
+# --- Two-factor verification (read from Gmail over IMAP) -------------------
+# TrackStreet sometimes stops after the password and asks for a code it
+# emails to the account. The script reads that code from the dedicated
+# Gmail inbox and types it in. Leave these blank to disable -- the run then
+# fails with an alert, the same as before this existed.
+#
+# GMAIL_APP_PASSWORD must be a Google *App Password* (16 letters, created at
+# https://myaccount.google.com/apppasswords -- needs 2-Step Verification on
+# that Gmail account), NOT the normal Gmail password, which IMAP rejects.
+GMAIL_ADDRESS = os.getenv("GMAIL_ADDRESS")
+# Google shows app passwords in groups of four ("abcd efgh ..."); strip the
+# spaces so a straight copy-paste into .env works.
+GMAIL_APP_PASSWORD = (os.getenv("GMAIL_APP_PASSWORD") or "").replace(" ", "") or None
+IMAP_HOST = os.getenv("IMAP_HOST", "imap.gmail.com")
+IMAP_FOLDER = os.getenv("IMAP_FOLDER", "INBOX")
+# Codes submitted (or resend requests) before giving up. Kept low on purpose
+# -- too many wrong codes can lock the TrackStreet account.
+VERIFY_MAX_ATTEMPTS = _int_env("VERIFY_MAX_ATTEMPTS", 3)
+# How long to watch the inbox for the email after each request. TrackStreet's
+# codes expire after 5 minutes, so there's no point waiting longer than that.
+VERIFY_EMAIL_WAIT_SEC = _int_env("VERIFY_EMAIL_WAIT_SEC", 120)
+
 # --- Working directories ----------------------------------------------------
 BASE_DIR = Path(os.getenv("BASE_DIR", r"C:\TrackStreetSync"))
 DOWNLOAD_DIR = BASE_DIR / "downloads"   # raw per-brand exports land here temporarily

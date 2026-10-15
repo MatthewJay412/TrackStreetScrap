@@ -23,6 +23,10 @@ Exit codes (visible in Task Scheduler's "Last Run Result" column):
 """
 
 import atexit
+import email
+import email.policy
+import html
+import imaplib
 import logging
 import logging.handlers
 import re
@@ -105,11 +109,20 @@ def tail_log(n_lines: int = 40) -> str:
 # ---------------------------------------------------------------------------
 # Retry helper
 # ---------------------------------------------------------------------------
+class VerificationError(Exception):
+    """The two-factor code step failed. Deliberately NOT retried by
+    with_retries(): each login retry would submit up to another
+    VERIFY_MAX_ATTEMPTS codes, and enough wrong codes can lock the
+    TrackStreet account -- far worse than one failed run."""
+
+
 def with_retries(fn, *args, what: str, **kwargs):
     last_exc = None
     for attempt in range(1, config.MAX_RETRIES + 2):  # +1 for the initial try
         try:
             return fn(*args, **kwargs)
+        except VerificationError:
+            raise  # see VerificationError -- retrying would burn more codes
         except Exception as exc:
             last_exc = exc
             logger.warning("%s failed (attempt %d): %s", what, attempt, exc)
@@ -123,6 +136,9 @@ def with_retries(fn, *args, what: str, **kwargs):
 # ---------------------------------------------------------------------------
 def login(page):
     logger.info("Navigating to TrackStreet login page")
+    # Any verification email received before this moment can't belong to
+    # this login -- see wait_for_verification_code().
+    code_requested_at = time.time()
     page.goto(config.TRACKSTREET_URL, timeout=config.NAV_TIMEOUT_MS)
 
     try:
@@ -136,18 +152,236 @@ def login(page):
         # UI ones. If TrackStreet's doesn't respond to Enter, replace this
         # with a click on the real submit button, e.g.:
         #   page.click('button:has-text("Log In")')
+        code_requested_at = time.time()
         page.press("#password", "Enter")
     except Exception:
         logger.info("Login fields not found -- likely already logged in from a saved session")
 
     # "Reporting" only appears once actually logged in -- confirmed via
-    # debug_explore.py, replaces the earlier placeholder.
-    page.get_by_role("button", name="Reporting").wait_for(timeout=config.NAV_TIMEOUT_MS)
+    # debug_explore.py, replaces the earlier placeholder. TrackStreet may
+    # instead stop on its "Verify your identity" page, so wait for
+    # whichever of the two shows up first.
+    reporting = page.get_by_role("button", name="Reporting")
+    verify_page = page.get_by_text(re.compile(r"verify\s+your\s+identity", re.I))
+    reporting.or_(verify_page).first.wait_for(timeout=config.NAV_TIMEOUT_MS)
+
+    if verify_page.first.is_visible():
+        try:
+            complete_verification(page, code_requested_at)
+        except VerificationError:
+            raise
+        except Exception as exc:
+            # Any other failure mid-verification (a selector timing out,
+            # etc.) must not be retried either -- same lockout reasoning.
+            raise VerificationError(f"Verification step failed: {exc}") from exc
+
     logger.info("Login successful")
+
+
+# ---------------------------------------------------------------------------
+# Two-factor verification (code read from Gmail over IMAP)
+# ---------------------------------------------------------------------------
+# Email body reads: "Your two-factor authentication code is: 682644"
+VERIFY_CODE_PATTERN = re.compile(r"two-factor authentication code is:?\s*(\d{4,8})", re.I)
+VERIFY_EMAIL_SUBJECT = "TrackStreet Verification Code"
+
+# Tolerance for the PC's clock and Gmail's disagreeing slightly, so a code
+# that arrives a few seconds "before" we asked for it isn't ignored.
+CLOCK_SKEW_SEC = 30
+
+
+def _email_text(raw: bytes) -> str:
+    """Subject plus every text part of an email, with HTML tags stripped,
+    so the code pattern matches whether TrackStreet sends plain or HTML."""
+    msg = email.message_from_bytes(raw, policy=email.policy.default)
+    chunks = [str(msg["Subject"] or "")]
+    for part in msg.walk():
+        if part.get_content_maintype() == "text":
+            try:
+                chunks.append(part.get_content())
+            except Exception:
+                pass  # an undecodable part shouldn't hide a readable one
+    text = re.sub(r"<[^>]+>", " ", " ".join(chunks))
+    return html.unescape(text)
+
+
+def newest_verification_code(imap, newer_than: float):
+    """Return (received_epoch, code) for the most recent TrackStreet
+    verification email received after `newer_than`, or None."""
+    # Re-selecting on every poll is what makes Gmail show newly arrived
+    # mail. readonly=True so the script never marks anything read/deleted.
+    imap.select(config.IMAP_FOLDER, readonly=True)
+    # IMAP's SINCE only filters by whole day, so go back a day to be safe
+    # around midnight; the precise time check happens below.
+    since = datetime.fromtimestamp(newer_than - 86400).strftime("%d-%b-%Y")
+    status, data = imap.search(None, "SUBJECT", f'"{VERIFY_EMAIL_SUBJECT}"', "SINCE", since)
+    if status != "OK" or not data or not data[0]:
+        return None
+
+    newest = None
+    for num in data[0].split():
+        status, parts = imap.fetch(num, "(INTERNALDATE BODY.PEEK[])")
+        if status != "OK" or not parts or not isinstance(parts[0], tuple):
+            continue
+        header, raw = parts[0]
+        # INTERNALDATE = when Gmail received it, which is more trustworthy
+        # than the sender-supplied Date header.
+        received_tuple = imaplib.Internaldate2tuple(header)
+        if received_tuple is None:
+            continue
+        received = time.mktime(received_tuple)
+        if received < newer_than - CLOCK_SKEW_SEC:
+            continue  # left over from an earlier login -- expired/superseded
+        match = VERIFY_CODE_PATTERN.search(_email_text(raw))
+        if match and (newest is None or received > newest[0]):
+            newest = (received, match.group(1))
+    return newest
+
+
+def wait_for_verification_code(newer_than: float, exclude: set):
+    """Poll Gmail until a verification email newer than `newer_than` shows
+    up, and return its code -- or None after VERIFY_EMAIL_WAIT_SEC.
+
+    Only the single newest email is considered. If its code is in `exclude`
+    (already tried and rejected), keep waiting for a newer one rather than
+    falling back to an older code, which TrackStreet will have superseded."""
+    deadline = time.time() + config.VERIFY_EMAIL_WAIT_SEC
+    try:
+        with imaplib.IMAP4_SSL(config.IMAP_HOST, timeout=30) as imap:
+            imap.login(config.GMAIL_ADDRESS, config.GMAIL_APP_PASSWORD)
+            while True:
+                found = newest_verification_code(imap, newer_than)
+                if found and found[1] not in exclude:
+                    received, code = found
+                    logger.info(
+                        "Found verification code in email received %s",
+                        datetime.fromtimestamp(received).strftime("%Y-%m-%d %H:%M:%S"),
+                    )
+                    return code
+                if time.time() >= deadline:
+                    return None
+                time.sleep(5)
+    except imaplib.IMAP4.error as exc:
+        raise VerificationError(
+            f"Gmail rejected the IMAP login ({exc}). Check GMAIL_ADDRESS and that "
+            f"GMAIL_APP_PASSWORD is a Google App Password, not the normal password."
+        ) from exc
+    except OSError as exc:
+        raise VerificationError(
+            f"Could not reach {config.IMAP_HOST} ({exc}) -- a firewall/proxy may be "
+            f"blocking IMAP (port 993)."
+        ) from exc
+
+
+def _tick_remember_device(page):
+    """Tick "Remember this device for N days" so verification isn't needed
+    on every run. Matches only "remember this device" since the number of
+    days in the label varies. Not fatal if it fails -- the code still logs
+    in, verification just comes back sooner."""
+    pattern = re.compile(r"remember\s+this\s+device", re.I)
+    try:
+        try:
+            page.get_by_label(pattern).check(timeout=5000)
+        except Exception:
+            # Styled checkboxes often hide the real <input>; clicking the
+            # label text toggles it the same way a person would.
+            page.get_by_text(pattern).click(timeout=5000)
+    except Exception as exc:
+        logger.warning("Could not tick 'Remember this device' -- continuing anyway: %s", exc)
+
+
+def complete_verification(page, code_requested_at: float):
+    logger.info("TrackStreet is asking for a verification code -- reading it from Gmail")
+    if not config.GMAIL_ADDRESS or not config.GMAIL_APP_PASSWORD:
+        raise VerificationError(
+            "TrackStreet asked for a verification code, but GMAIL_ADDRESS / "
+            "GMAIL_APP_PASSWORD aren't set in .env, so it can't be read automatically."
+        )
+
+    code_box = page.get_by_label(re.compile(r"verification\s+code", re.I)).or_(
+        # Fallback if the label isn't wired to the input: it's the only
+        # text box on that page.
+        page.locator("input[type='text']:visible, input[type='tel']:visible, "
+                     "input[type='number']:visible, input:not([type]):visible")
+    ).first
+    log_in_button = page.get_by_role("button", name=re.compile(r"^\s*log\s*in\s*$", re.I))
+    resend_button = page.get_by_role("button", name=re.compile(r"resend", re.I))
+    reporting = page.get_by_role("button", name="Reporting")
+
+    def request_new_code():
+        nonlocal code_requested_at
+        code_requested_at = time.time()
+        resend_button.click()
+
+    tried = set()
+    for attempt in range(1, config.VERIFY_MAX_ATTEMPTS + 1):
+        code = wait_for_verification_code(code_requested_at, exclude=tried)
+        if code is None:
+            logger.warning(
+                "No new verification email within %ds (attempt %d of %d)",
+                config.VERIFY_EMAIL_WAIT_SEC, attempt, config.VERIFY_MAX_ATTEMPTS,
+            )
+            if attempt < config.VERIFY_MAX_ATTEMPTS:
+                logger.info("Clicking Resend Code")
+                request_new_code()
+            continue
+
+        tried.add(code)
+        logger.info("Entering verification code (attempt %d of %d)", attempt, config.VERIFY_MAX_ATTEMPTS)
+        code_box.fill(code)
+        _tick_remember_device(page)
+        log_in_button.click()
+
+        try:
+            reporting.wait_for(timeout=config.NAV_TIMEOUT_MS)
+            logger.info("Verification code accepted")
+            return
+        except Exception:
+            pass
+
+        if not resend_button.is_visible():
+            raise VerificationError(
+                "Submitted a verification code and landed on an unexpected page "
+                "(neither logged in nor back on the verification page)."
+            )
+        logger.warning("Verification code was not accepted (attempt %d of %d)",
+                       attempt, config.VERIFY_MAX_ATTEMPTS)
+        if attempt < config.VERIFY_MAX_ATTEMPTS:
+            # The rejected code is now useless, so ask for a fresh one
+            # straight away instead of waiting out the inbox poll first.
+            logger.info("Clicking Resend Code")
+            request_new_code()
+
+    raise VerificationError(
+        f"Could not get past TrackStreet's verification page after "
+        f"{config.VERIFY_MAX_ATTEMPTS} attempt(s) -- stopped there to avoid "
+        f"locking the account."
+    )
+
+
+def dismiss_cookie_banner(page):
+    """Close TrackStreet's HubSpot cookie-consent banner if it's showing.
+    It covers the page and swallows clicks ("intercepts pointer events"),
+    and it comes back whenever the browser profile is new -- e.g. right
+    after device verification on a fresh profile. Accepting it once is
+    remembered in the persistent profile, so this is normally a no-op."""
+    banner = page.locator("#hs-eu-cookie-confirmation")
+    try:
+        if not banner.is_visible():
+            return
+        logger.info("Dismissing cookie consent banner")
+        page.locator("#hs-eu-confirmation-button").click(timeout=5000)
+        banner.wait_for(state="hidden", timeout=5000)
+    except Exception as exc:
+        # Button missing/renamed: the banner is only an overlay, so taking
+        # it off the page unblocks clicks just the same.
+        logger.warning("Couldn't click the cookie banner's button (%s) -- removing it instead", exc)
+        page.evaluate("document.getElementById('hs-eu-cookie-confirmation')?.remove()")
 
 
 def navigate_to_reports(page):
     logger.info("Navigating to Market Reports > All Crawls")
+    dismiss_cookie_banner(page)
     page.get_by_role("button", name="Reporting").click()
     page.get_by_role("button", name="Market Reports", exact=True).click()
     page.get_by_title("All Crawls").click()  # "All Crawls" is a report page, not a time filter
@@ -171,6 +405,9 @@ def _safe_filename(text: str) -> str:
 
 def export_brand(page, brand_name: str) -> Path:
     logger.info("Switching to brand: %s", brand_name)
+    # The banner script loads asynchronously, so it can pop up after
+    # navigate_to_reports() already checked for it.
+    dismiss_cookie_banner(page)
     # The button's own label changes to reflect whichever brand is
     # CURRENTLY selected ("Brand: Elkay Inc.", then later "Brand: World
     # Dryer", etc.) -- matching just the "Brand:" prefix means this one
@@ -566,11 +803,12 @@ def run():
             logger.error("Login/navigation failed after retries: %s", exc)
             send_alert(
                 "Login failed -- run aborted",
-                f"{exc}\n\nIf the attached screenshot shows a 'verify this "
-                f"device' or email-verification page, the 30-day device "
-                f"trust likely expired. Fix: someone needs to run "
-                f"debug_explore.py once, headed, and complete verification "
-                f"manually -- see README.\n\nRecent log:\n{tail_log()}",
+                f"{exc}\n\nIf this mentions the verification page, the script "
+                f"tried to read the code from Gmail and couldn't get through "
+                f"-- the log below says why (bad app password, no email "
+                f"arrived, code rejected). Fallback: run debug_explore.py "
+                f"once, headed, and complete verification manually -- see "
+                f"README.\n\nRecent log:\n{tail_log()}",
             )
             sys.exit(1)
 

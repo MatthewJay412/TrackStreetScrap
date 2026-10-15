@@ -84,12 +84,13 @@ TrackStreet's raw export has a few quirks that get fixed automatically before th
 
 ## The 30-day email verification thing
 
-TrackStreet occasionally asks you to verify your device by email, and remembers that for about 30 days. We asked TrackStreet to turn this off or extend it for this account — they said no. So here's where things stand:
+TrackStreet occasionally asks you to verify your device by email, and remembers that for a while (usually ~30 days, but not always). We asked TrackStreet to turn this off or extend it for this account — they said no. So here's where things stand:
 
 - The script has a "remembered" browser profile that avoids this most of the time
-- If it does come up, the script can't get past it on its own (nothing legitimate can auto-solve an email verification) — it'll fail that run, screenshot the verification page, and email you about it
-- The fix, when it happens: run `debug_explore.py` once, by hand, with a visible browser, and click through the verification yourself. Takes two minutes.
-- We looked into fully automating this (having the script check a dedicated inbox and enter the code itself) and decided to hold off — it's a real chunk of extra complexity for a problem we don't even know the real frequency of yet. Worth revisiting once we've seen how often it actually comes up in practice.
+- When the "Verify your identity" page does come up, the script now handles it itself: it logs into the dedicated Gmail inbox over IMAP, grabs the code from the newest "Your TrackStreet Verification Code" email (only ones that arrived *after* this login, so it never uses a stale code), types it in, ticks "Remember this device", and clicks Log In
+- It gives up after 3 tries (`VERIFY_MAX_ATTEMPTS`) so it can't lock the account, and it won't retry the whole login on top of that. If no email shows up within 2 minutes, it clicks Resend Code; that counts as one of the 3 tries
+- **Setup (one time):** put the Gmail address and a Google **App Password** in `.env` as `GMAIL_ADDRESS` / `GMAIL_APP_PASSWORD`. The normal Gmail password won't work over IMAP. To make an App Password, turn on 2-Step Verification for that Gmail account, then go to https://myaccount.google.com/apppasswords
+- If it still can't get through (wrong app password, IMAP blocked by the network, codes rejected), it fails that run and emails you; the log says which. The manual fallback still works: run `debug_explore.py` once, by hand, with a visible browser, and click through the verification yourself
 
 ## Reading the results of a run
 
